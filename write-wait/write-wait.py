@@ -2,7 +2,6 @@ import bisect
 import statistics
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any
 
 from simulate import Loop, Sleep, get_current_ts, Timestamp
 
@@ -20,16 +19,9 @@ class Result(Enum):
 
 
 @dataclass
-class TSValue:
-    value: Any
-    ts: Timestamp
-    """When the value was written."""
-
-
-@dataclass
 class Write:
     key: str
-    ts_value: TSValue
+    ts: Timestamp
 
 
 @dataclass
@@ -45,7 +37,8 @@ class LogEntry:
 @dataclass
 class Node:
     role: Role
-    data: dict[str, TSValue] = field(default_factory=dict)
+    data: dict[str, Timestamp] = field(default_factory=dict)
+    """A key-value store. Values are actually the last-written timestamp."""
     log: list[LogEntry] = field(default_factory=list)
     committed_ts: Timestamp = -1
     last_applied_entry: LogEntry | None = None
@@ -59,10 +52,9 @@ class Node:
         self._loop = loop
         self.nodes = nodes[:]
         self.node_replication_positions = {id(n): -1 for n in nodes}
-        loop.call_soon(self.replicate, nodes)  # Start replicating.
+        loop.call_soon(self.replicate, nodes)
 
     async def replicate(self, nodes: list["Node"]):
-        """Pull and apply oplog entries from the primary."""
         peers = [n for n in nodes if n is not self]
         while True:
             await Sleep.random_duration()
@@ -83,7 +75,7 @@ class Node:
                 i = bisect.bisect_right(primary.log, self.log[-1])
 
             entry = primary.log[i]
-            self.data[entry.write.key] = entry.write.ts_value
+            self.data[entry.write.key] = entry.write.ts
             self.log.append(entry)
             self.node_replication_positions[id(self)] = entry.ts
             await Sleep.random_duration()
@@ -106,13 +98,13 @@ class Node:
     async def update_committed_ts(self, ts: Timestamp):
         self.committed_ts = max(self.committed_ts, ts)
 
-    async def write(self, key: str, value: Any):
+    async def write(self, key: str):
         write_start = get_current_ts()
-        w = Write(key=key, ts_value=TSValue(value=value, ts=write_start))
+        w = Write(key=key, ts=write_start)
         if self.role is not Role.PRIMARY:
             return Result.ERROR
 
-        self.data[w.key] = w.ts_value
+        self.data[w.key] = w.ts
         # TODO: Try a random sleep before appending the log entry.
         self.log.append(LogEntry(write=w, ts=write_start))
         self.node_replication_positions[id(self)] = write_start
@@ -132,13 +124,13 @@ class Node:
                 # TODO: abort on role change or rollback.
                 await Sleep.random_duration()
 
-        ts_value = self.data[key]
         # Speculative majority wait.
-        while self.committed_ts < ts_value.ts:
+        last_written_ts = self.data[key]
+        while self.committed_ts < last_written_ts:
             # TODO: abort on role change or rollback.
             await Sleep.random_duration()
 
-        return ts_value.value
+        return last_written_ts
 
 
 async def main(loop: "Loop"):
@@ -148,7 +140,7 @@ async def main(loop: "Loop"):
     for n in nodes:
         n.initiate(loop, nodes)
 
-    write_result = await primary.write(key="x", value="x-value")
+    write_result = await primary.write(key="x")
     print(f"Write result: {write_result}")
     assert write_result is Result.OK
 
