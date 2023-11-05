@@ -1,8 +1,11 @@
 import bisect
+import enum
 import logging
+import random
 import statistics
+import time
+import uuid
 from dataclasses import dataclass, field
-from enum import Enum, auto
 
 from simulate import (
     get_event_loop,
@@ -13,13 +16,13 @@ from simulate import (
 )
 
 logger = logging.getLogger("write-wait")
-D = 5  # Write-wait duration in milliseconds.
-MAX_DELAY = 10 * D
+WAIT_DURATION = 5
+MAX_DELAY = 10 * WAIT_DURATION
 
 
-class Role(Enum):
-    PRIMARY = auto()
-    SECONDARY = auto()
+class Role(enum.Enum):
+    PRIMARY = enum.auto()
+    SECONDARY = enum.auto()
 
 
 @dataclass(order=True)
@@ -37,14 +40,15 @@ class OpTime:
 @dataclass(order=True)
 class Write:
     key: str = field(compare=False)
+    value: str = field(compare=False)
     optime: OpTime
 
 
 @dataclass
 class Node:
     role: Role
-    data: dict[str, OpTime] = field(default_factory=dict)
-    """Data is a kv store. Values are actually the last-written optime."""
+    # Map key to (value, last-written time).
+    data: dict[str, tuple[str, OpTime]] = field(default_factory=dict)
     log: list[Write] = field(default_factory=list)
     committed_optime: OpTime = field(default_factory=OpTime.default)
     last_applied_entry: Write | None = None
@@ -55,8 +59,12 @@ class Node:
     def initiate(self, nodes: list["Node"]):
         self.nodes = nodes[:]
         self.node_replication_positions = {id(n): OpTime.default() for n in nodes}
-        get_event_loop().create_task(self.noop_writer())
-        get_event_loop().create_task(self.replicate())
+        get_event_loop().create_task("no-op writer", self.noop_writer())
+        get_event_loop().create_task("replication", self.replicate())
+
+    @property
+    def last_applied(self) -> OpTime:
+        return self.log[-1].optime if self.log else OpTime.default()
 
     async def noop_writer(self):
         while True:
@@ -64,7 +72,7 @@ class Node:
             if self.role is not Role.PRIMARY:
                 continue
 
-            await self.write("noop")
+            await self.write("noop", "")
 
     async def replicate(self):
         peers = [n for n in self.nodes if n is not self]
@@ -79,7 +87,6 @@ class Node:
                 continue  # No primary.
 
             if len(self.log) >= len(primary.log):
-                # TODO: rollback if my log is longer than primary's.
                 continue
 
             # Find the next entry to replicate and apply.
@@ -89,7 +96,7 @@ class Node:
                 i = bisect.bisect_right(primary.log, self.log[-1])
 
             entry = primary.log[i]
-            self.data[entry.key] = entry.optime
+            self.data[entry.key] = (entry.value, entry.optime)
             self.log.append(entry)
             self.node_replication_positions[id(self)] = entry.optime
             await sleep_random(MAX_DELAY)
@@ -115,52 +122,154 @@ class Node:
     def update_committed_optime(self, optime: OpTime):
         self.committed_optime = max(self.committed_optime, optime)
 
-    async def write(self, key: str) -> OpTime:
-        """Update a key and return the write's OpTime."""
+    async def write(self, key: str, value: str):
+        """Update a key."""
         optime = OpTime(get_current_ts(), 0)
         if len(self.log) > 0 and self.log[-1].optime.ts == optime.ts:
             optime.i = self.log[-1].optime.i + 1
 
-        w = Write(key=key, optime=optime)
+        w = Write(key=key, value=value, optime=optime)
         if self.role is not Role.PRIMARY:
             raise Exception("Not primary")
 
-        self.data[w.key] = w.optime
+        self.data[w.key] = (value, w.optime)
         # TODO: Try a realistic oplog, reserve a future slot and eventually fill it.
         self.log.append(w)
         self.node_replication_positions[id(self)] = optime
         while self.committed_optime < optime:
-            # TODO: abort on role change or rollback.
             await sleep_random(MAX_DELAY)
 
-        # TODO: abort on role change or rollback.
         await sleep_random(MAX_DELAY)
-        return optime
 
-    async def read(self, key: str) -> OpTime:
-        """Return a key's last write OpTime."""
+    async def read(self, key: str) -> str | None:
+        """Return a key's latest value."""
         query_start = get_current_ts()
         if self.role is Role.SECONDARY:
-            # Wait until replication catches up.
-            while not self.log or self.log[-1].optime.ts + D < query_start:
-                # TODO: abort on role change or rollback.
+            # Wait until replication catches up, aka "barrier".
+            while self.last_applied.ts + WAIT_DURATION < query_start:
                 await sleep_random(MAX_DELAY)
 
-        # Speculative majority wait.
-        last_written_optime = self.data[key]
+        # Wait for item's last-written OpTime (last applied entry if no item) to commit,
+        # aka "rinse".
+        value, last_written_optime = self.data.get(key, (None, self.last_applied))
         while self.committed_optime < last_written_optime:
-            # TODO: abort on role change or rollback.
             await sleep_random(MAX_DELAY)
 
-        return last_written_optime
+        return value
 
 
-async def client(client_id: int, primary: Node, secondary: Node):
-    write_optime = await primary.write(key="x")
-    logger.info(f"client {client_id} write OpTime: {write_optime}")
-    read_optime = await secondary.read(key="x")
-    logger.info(f"client {client_id} secondary read OpTime: {read_optime}")
-    assert read_optime >= write_optime, f"client {client_id} stale read"
+@dataclass
+class ClientLogEntry:
+    class OpType(enum.Enum):
+        Write = enum.auto()
+        Read = enum.auto()
+
+    client_id: int
+    op_type: OpType
+    start_ts: Timestamp
+    end_ts: Timestamp
+    key: str
+    value: str | None = None
+
+
+async def client(
+    client_id: int,
+    nodes: list[Node],
+    client_log: list[ClientLogEntry],
+):
+    for _ in range(20):
+        start = get_current_ts()
+        if random.randint(0, 1) == 0:
+            # Write to primary.
+            value = str(uuid.uuid4())
+            logger.info(f"Client {client_id} writing {value} to primary")
+            primary = next(n for n in nodes if n.role == Role.PRIMARY)
+            await primary.write(key="x", value=value)
+            logger.info(f"Client {client_id} wrote {value}")
+            client_log.append(
+                ClientLogEntry(
+                    client_id=client_id,
+                    op_type=ClientLogEntry.OpType.Write,
+                    start_ts=start,
+                    end_ts=get_current_ts(),
+                    key="x",
+                    value=value,
+                )
+            )
+        else:
+            # Read from any node.
+            node_index = random.randint(0, len(nodes) - 1)
+            node = (nodes)[node_index]
+            node_name = f"node {node_index} {node.role.name}"
+            logger.info(f"Client {client_id} reading from {node_name}")
+            value = await node.read(key="x")
+            logger.info(f"Client {client_id} read {value} from {node_name}")
+            client_log.append(
+                ClientLogEntry(
+                    client_id=client_id,
+                    op_type=ClientLogEntry.OpType.Read,
+                    start_ts=start,
+                    end_ts=get_current_ts(),
+                    key="x",
+                    value=value,
+                )
+            )
+
+
+def check_linearizability(client_log: list[ClientLogEntry]) -> None:
+    """True if "client_log" is linearizable.
+
+    Based on Gavin Lowe, "Testing for Linearizability", 2016, which summarizes Wing and
+    Gong, "Testing and Verifying Concurrent Objects", 1993.
+    """
+
+    def linearize(
+        log: list[ClientLogEntry], model: dict
+    ) -> list[ClientLogEntry] | None:
+        """Try linearizing a suffix of the log with the KV store "model" in some state.
+
+        Return a linearization if possible, else None.
+        """
+        if len(log) == 0:
+            return log  # Empty history is already linearized.
+
+        for i, entry in enumerate(log):
+            # Try linearizing "entry" at history's start. No other entry's end can
+            # precede this entry's start.
+            if any(e for e in log if e is not entry and e.end_ts < entry.start_ts):
+                continue
+
+            if entry.op_type is ClientLogEntry.OpType.Write:
+                # What would the KV store contain if we did this write now?
+                model_prime = model.copy()
+                model_prime[entry.key] = entry.value
+            else:
+                # What would this query return if we ran it now?
+                if model.get(entry.key) != entry.value:
+                    continue  # "entry" can't be linearized first.
+                model_prime = model
+
+            # Try to linearize the rest of the log with the KV store in this state.
+            log_prime = log.copy()
+            log_prime.pop(i)
+            linearization = linearize(log_prime, model_prime)
+            if linearization is not None:
+                return [entry] + linearization
+
+        return None
+
+    check_start = time.monotonic()
+    # Sort by start_ts to make the search succeed sooner.
+    result = linearize(sorted(client_log, key=lambda y: y.start_ts), {})
+    check_duration = time.monotonic() - check_start
+    if result is None:
+        raise Exception("not linearizable!")
+
+    logging.info(
+        f"Linearization of {len(client_log)} entries took {check_duration:.2f} sec:"
+    )
+    for x in result:
+        logging.info(x)
 
 
 async def main():
@@ -171,17 +280,25 @@ async def main():
         n.initiate(nodes)
 
     lp = get_event_loop()
-    t1 = lp.create_task(client(client_id=1, primary=primary, secondary=secondaries[0]))
-    t2 = lp.create_task(client(client_id=2, primary=primary, secondary=secondaries[0]))
+    client_log: list[ClientLogEntry] = []
+    tasks = [
+        lp.create_task(
+            name=f"client {i}",
+            coro=client(client_id=i, nodes=nodes, client_log=client_log),
+        )
+        for i in range(10)
+    ]
 
-    await t1
-    await t2
+    for t in tasks:
+        await t
+
     lp.stop()
+    logging.info(f"Finished after {get_current_ts()} ms (simulated)")
+    check_linearizability(client_log)
 
 
 if __name__ == "__main__":
     initiate_logging()
     event_loop = get_event_loop()
-    event_loop.create_task(main())
+    event_loop.create_task("main", main())
     event_loop.run()
-    print(f"Finished after {get_current_ts()} ms (simulated)")
