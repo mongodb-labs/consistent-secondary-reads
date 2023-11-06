@@ -1,3 +1,4 @@
+import argparse
 import bisect
 import enum
 import logging
@@ -216,8 +217,8 @@ async def client(
             )
 
 
-def check_linearizability(client_log: list[ClientLogEntry]) -> None:
-    """True if "client_log" is linearizable.
+def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
+    """Throw exception if "client_log" is not linearizable.
 
     Based on Gavin Lowe, "Testing for Linearizability", 2016, which summarizes Wing and
     Gong, "Testing and Verifying Concurrent Objects", 1993.
@@ -272,7 +273,7 @@ def check_linearizability(client_log: list[ClientLogEntry]) -> None:
         logging.info(x)
 
 
-async def main():
+async def main(check_linearizability: bool):
     primary = Node(role=Role.PRIMARY)
     secondaries = [Node(role=Role.SECONDARY), Node(role=Role.SECONDARY)]
     nodes = [primary] + secondaries
@@ -294,11 +295,18 @@ async def main():
 
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
-    check_linearizability(client_log)
+    if check_linearizability:
+        do_linearizability_check(client_log)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-linearizability", default=False, action="store_true")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
     initiate_logging()
     event_loop = get_event_loop()
-    event_loop.create_task("main", main())
+    event_loop.create_task("main", main(**vars(parse_args())))
     event_loop.run()
