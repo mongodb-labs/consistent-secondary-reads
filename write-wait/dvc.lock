@@ -9,8 +9,8 @@ stages:
       size: 5343
     - path: write_wait.py
       hash: md5
-      md5: 75143b522c9cb57d0290e1994c55ab85
-      size: 13388
+      md5: f55bb79d28c6b8ba832599db9485f882
+      size: 12738
     params:
       params.yaml:
         write_wait:

@@ -1,4 +1,5 @@
 {
-    "mean_write_latency": 21.142857142857142,
-    "mean_read_latency": 21.666666666666668
+    "mean_write_latency": 22.0,
+    "mean_read_latency": 9.6,
+    "mean_commit_wait": 18.333333333333332
 }

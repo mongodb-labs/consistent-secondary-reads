@@ -61,6 +61,8 @@ class Node:
         self.one_way_latency: int = cfg.one_way_latency
         self.noop_rate: int = cfg.noop_rate
         self.write_wait: int = cfg.write_wait
+        self._total_commit_wait: int = 0  # For reporting.
+        self._number_of_writes: int = 0  # For reporting.
 
     def initiate(self, nodes: list["Node"]):
         self.nodes = nodes[:]
@@ -71,6 +73,11 @@ class Node:
     @property
     def last_applied(self) -> OpTime:
         return self.log[-1].optime if self.log else OpTime.default()
+
+    @property
+    def mean_commit_wait(self) -> float | None:
+        if self._number_of_writes > 0:
+            return self._total_commit_wait / self._number_of_writes
 
     async def noop_writer(self):
         while True:
@@ -151,9 +158,14 @@ class Node:
         self.log.append(w)
         self.node_replication_positions[id(self)] = optime
         assert write_start == get_current_ts()  # Assume no time since the write began.
-        await sleep(self.write_wait)
         while self.committed_optime < optime:
             await sleep(1)
+
+        write_duration = get_current_ts() - write_start
+        self._total_commit_wait += write_duration
+        self._number_of_writes += 1
+        if self.write_wait > write_duration:
+            await sleep(self.write_wait - write_duration)
 
     async def read(self, key: str) -> str | None:
         """Return a key's latest value."""
@@ -360,6 +372,7 @@ async def main_coro(cfg: DictConfig, live: dvclive.Live):
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
     log_metrics(live, client_log)
+    live.log_metric("mean_commit_wait", primary.mean_commit_wait)
     logging.info(live.summary)
     if cfg.check_linearizability:
         do_linearizability_check(client_log)
