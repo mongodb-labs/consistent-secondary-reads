@@ -1,7 +1,6 @@
 import heapq
 import inspect
 import logging
-import random
 import typing
 from dataclasses import dataclass, field
 
@@ -87,9 +86,9 @@ class _Task(Future):
             _print_coro_position(t)
 
 
-def sleep_random(max_delay: int) -> Future:
+def sleep(delay: int) -> Future:
     f = Future()
-    _global_loop.call_later(max_delay=max_delay, callback=f.resolve)
+    _global_loop.call_later(delay=delay, callback=f.resolve)
     return f
 
 
@@ -133,9 +132,9 @@ class EventLoop:
         return self.call_later(0, callback, *args, **kwargs)
 
     def call_later(
-        self, max_delay: int, callback: typing.Callable, *args, **kwargs
+        self, delay: int, callback: typing.Callable, *args, **kwargs
     ) -> Future:
-        """Schedule a callback after a random delay.
+        """Schedule a callback after a delay.
 
         Returns a Future that will be resolved after the callback runs.
         """
@@ -146,7 +145,6 @@ class EventLoop:
             callback(*args, **kwargs)
             f.resolve()
 
-        delay = random.randint(0, max_delay)
         alarm = EventLoop._Alarm(deadline=_current_ts + delay, callback=alarm_callback)
         heapq.heappush(self._alarms, alarm)
         return f
@@ -163,6 +161,10 @@ _global_loop = EventLoop()
 
 
 def get_event_loop() -> EventLoop:
+    """
+
+    :rtype: object
+    """
     return _global_loop
 
 

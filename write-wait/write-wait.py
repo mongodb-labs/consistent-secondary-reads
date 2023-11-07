@@ -12,13 +12,11 @@ from simulate import (
     get_event_loop,
     get_current_ts,
     initiate_logging,
-    sleep_random,
+    sleep,
     Timestamp,
 )
 
 logger = logging.getLogger("write-wait")
-WAIT_DURATION = 5
-MAX_DELAY = 10 * WAIT_DURATION
 
 
 class Role(enum.Enum):
@@ -45,17 +43,21 @@ class Write:
     optime: OpTime
 
 
-@dataclass
 class Node:
-    role: Role
-    # Map key to (value, last-written time).
-    data: dict[str, tuple[str, OpTime]] = field(default_factory=dict)
-    log: list[Write] = field(default_factory=list)
-    committed_optime: OpTime = field(default_factory=OpTime.default)
-    last_applied_entry: Write | None = None
-    nodes: list["Node"] | None = None
-    node_replication_positions: dict[int, OpTime] = field(default_factory=dict)
-    """Map Node ids to their last-replicated timestamps."""
+    def __init__(self, role: Role, ns: argparse.Namespace, prng: random.Random):
+        self.role = role
+        self.prng = prng
+        # Map key to (value, last-written time).
+        self.data: dict[str, tuple[str, OpTime]] = {}
+        self.log: list[Write] = []
+        self.committed_optime: OpTime = OpTime.default()
+        self.last_applied_entry: Write | None = None
+        self.nodes: list["Node"] | None = None
+        # Map Node ids to their last-replicated timestamps.
+        self.node_replication_positions: dict[int, OpTime] = {}
+        self.one_way_latency: int = ns.one_way_latency
+        self.noop_rate: int = ns.noop_rate
+        self.write_wait: int = ns.write_wait
 
     def initiate(self, nodes: list["Node"]):
         self.nodes = nodes[:]
@@ -69,7 +71,7 @@ class Node:
 
     async def noop_writer(self):
         while True:
-            await sleep_random(MAX_DELAY)
+            await sleep(self.noop_rate)
             if self.role is not Role.PRIMARY:
                 continue
 
@@ -78,7 +80,7 @@ class Node:
     async def replicate(self):
         peers = [n for n in self.nodes if n is not self]
         while True:
-            await sleep_random(MAX_DELAY)
+            await sleep(self.one_way_latency_value())  # Receive an entry from primary.
             if self.role is Role.PRIMARY:
                 continue
 
@@ -100,16 +102,21 @@ class Node:
             self.data[entry.key] = (entry.value, entry.optime)
             self.log.append(entry)
             self.node_replication_positions[id(self)] = entry.optime
-            await sleep_random(MAX_DELAY)
-            # Don't use call_later, this can't handle out-of-order messages yet.
-            primary.update_secondary_position(self, entry.optime)
+            get_event_loop().call_later(
+                self.one_way_latency_value(),
+                primary.update_secondary_position,
+                secondary=self,
+                optime=entry.optime,
+            )
 
     def update_secondary_position(self, secondary: "Node", optime: OpTime):
         if self.role is not Role.PRIMARY:
             return
 
-        # TODO: what about delayed messages / rollback?
-        self.node_replication_positions[id(secondary)] = optime
+        # Handle out-of-order messages with max(), assume no rollbacks.
+        self.node_replication_positions[id(secondary)] = max(
+            self.node_replication_positions[id(secondary)], optime
+        )
         self.committed_optime = statistics.median(
             self.node_replication_positions.values()
         )
@@ -117,7 +124,9 @@ class Node:
         for n in self.nodes:
             if n is not self:
                 get_event_loop().call_later(
-                    MAX_DELAY, n.update_committed_optime, self.committed_optime
+                    self.one_way_latency_value(),
+                    n.update_committed_optime,
+                    self.committed_optime,
                 )
 
     def update_committed_optime(self, optime: OpTime):
@@ -125,7 +134,8 @@ class Node:
 
     async def write(self, key: str, value: str):
         """Update a key."""
-        optime = OpTime(get_current_ts(), 0)
+        write_start = get_current_ts()
+        optime = OpTime(write_start, 0)
         if len(self.log) > 0 and self.log[-1].optime.ts == optime.ts:
             optime.i = self.log[-1].optime.i + 1
 
@@ -137,26 +147,29 @@ class Node:
         # TODO: Try a realistic oplog, reserve a future slot and eventually fill it.
         self.log.append(w)
         self.node_replication_positions[id(self)] = optime
+        assert write_start == get_current_ts()  # Assume no time since the write began.
+        await sleep(self.write_wait)
         while self.committed_optime < optime:
-            await sleep_random(MAX_DELAY)
-
-        await sleep_random(MAX_DELAY)
+            await sleep(1)
 
     async def read(self, key: str) -> str | None:
         """Return a key's latest value."""
         query_start = get_current_ts()
         if self.role is Role.SECONDARY:
             # Wait until replication catches up, aka "barrier".
-            while self.last_applied.ts + WAIT_DURATION < query_start:
-                await sleep_random(MAX_DELAY)
+            while self.last_applied.ts + self.write_wait < query_start:
+                await sleep(1)
 
         # Wait for item's last-written OpTime (last applied entry if no item) to commit,
         # aka "rinse".
         value, last_written_optime = self.data.get(key, (None, self.last_applied))
         while self.committed_optime < last_written_optime:
-            await sleep_random(MAX_DELAY)
+            await sleep(1)
 
         return value
+
+    def one_way_latency_value(self) -> int:
+        return round(self.prng.expovariate(1 / self.one_way_latency))
 
 
 @dataclass
@@ -173,55 +186,63 @@ class ClientLogEntry:
     value: str | None = None
 
 
-async def client(
+async def reader(
     client_id: int,
+    start_ts: Timestamp,
     nodes: list[Node],
     client_log: list[ClientLogEntry],
+    prng: random.Random,
 ):
-    for _ in range(20):
-        start = get_current_ts()
-        if random.randint(0, 1) == 0:
-            # Write to primary.
-            value = str(uuid.uuid4())
-            logger.info(f"Client {client_id} writing {value} to primary")
-            primary = next(n for n in nodes if n.role == Role.PRIMARY)
-            await primary.write(key="x", value=value)
-            logger.info(f"Client {client_id} wrote {value}")
-            client_log.append(
-                ClientLogEntry(
-                    client_id=client_id,
-                    op_type=ClientLogEntry.OpType.Write,
-                    start_ts=start,
-                    end_ts=get_current_ts(),
-                    key="x",
-                    value=value,
-                )
-            )
-        else:
-            # Read from any node.
-            node_index = random.randint(0, len(nodes) - 1)
-            node = (nodes)[node_index]
-            node_name = f"node {node_index} {node.role.name}"
-            logger.info(f"Client {client_id} reading from {node_name}")
-            value = await node.read(key="x")
-            logger.info(f"Client {client_id} read {value} from {node_name}")
-            client_log.append(
-                ClientLogEntry(
-                    client_id=client_id,
-                    op_type=ClientLogEntry.OpType.Read,
-                    start_ts=start,
-                    end_ts=get_current_ts(),
-                    key="x",
-                    value=value,
-                )
-            )
+    await sleep(start_ts)
+    assert get_current_ts() == start_ts  # Deterministic scheduling!
+    # Read from any node.
+    node_index = prng.randint(0, len(nodes) - 1)
+    node = (nodes)[node_index]
+    node_name = f"node {node_index} {node.role.name}"
+    logger.info(f"Client {client_id} reading from {node_name}")
+    value = await node.read(key="x")
+    logger.info(f"Client {client_id} read {value} from {node_name}")
+    client_log.append(
+        ClientLogEntry(
+            client_id=client_id,
+            op_type=ClientLogEntry.OpType.Read,
+            start_ts=start_ts,
+            end_ts=get_current_ts(),
+            key="x",
+            value=value,
+        )
+    )
+
+
+async def writer(
+    client_id: int,
+    start_ts: Timestamp,
+    primary: Node,
+    client_log: list[ClientLogEntry],
+):
+    await sleep(start_ts)
+    assert get_current_ts() == start_ts  # Deterministic scheduling!
+    value = str(uuid.uuid4())
+    logger.info(f"Client {client_id} writing {value} to primary")
+    await primary.write(key="x", value=value)
+    logger.info(f"Client {client_id} wrote {value}")
+    client_log.append(
+        ClientLogEntry(
+            client_id=client_id,
+            op_type=ClientLogEntry.OpType.Write,
+            start_ts=start_ts,
+            end_ts=get_current_ts(),
+            key="x",
+            value=value,
+        )
+    )
 
 
 def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
     """Throw exception if "client_log" is not linearizable.
 
-    Based on Gavin Lowe, "Testing for Linearizability", 2016, which summarizes Wing and
-    Gong, "Testing and Verifying Concurrent Objects", 1993.
+    Based on Lowe, "Testing for Linearizability", 2016, which summarizes Wing & Gong,
+    "Testing and Verifying Concurrent Objects", 1993. Don't do Lowe's memoization trick.
     """
 
     def linearize(
@@ -273,40 +294,95 @@ def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
         logging.info(x)
 
 
-async def main(check_linearizability: bool):
-    primary = Node(role=Role.PRIMARY)
-    secondaries = [Node(role=Role.SECONDARY), Node(role=Role.SECONDARY)]
+async def main(ns: argparse.Namespace):
+    logging.info(vars(ns))
+    prng = random.Random(ns.seed)
+    primary = Node(role=Role.PRIMARY, ns=ns, prng=prng)
+    secondaries = [
+        Node(role=Role.SECONDARY, ns=ns, prng=prng),
+        Node(role=Role.SECONDARY, ns=ns, prng=prng),
+    ]
     nodes = [primary] + secondaries
     for n in nodes:
         n.initiate(nodes)
 
     lp = get_event_loop()
     client_log: list[ClientLogEntry] = []
-    tasks = [
-        lp.create_task(
-            name=f"client {i}",
-            coro=client(client_id=i, nodes=nodes, client_log=client_log),
-        )
-        for i in range(10)
-    ]
+    tasks = []
+    start_ts = 0
+    # Schedule some tasks with Poisson start times. Each does one read or one write.
+    for i in range(ns.operations):
+        start_ts += round(prng.expovariate(1 / ns.interarrival))
+        if prng.randint(0, 1) == 0:
+            coro = writer(
+                client_id=i, start_ts=start_ts, primary=primary, client_log=client_log
+            )
+        else:
+            coro = reader(
+                client_id=i,
+                start_ts=start_ts,
+                nodes=nodes,
+                client_log=client_log,
+                prng=prng,
+            )
+        tasks.append(lp.create_task(name=f"client {i}", coro=coro))
 
     for t in tasks:
         await t
 
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
-    if check_linearizability:
+    if ns.check_linearizability:
         do_linearizability_check(client_log)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--check-linearizability", default=False, action="store_true")
+    parser.add_argument(
+        "--check-linearizability",
+        default=False,
+        action="store_true",
+        help="Check linearizability at the end (could be slow)",
+    )
+    parser.add_argument(
+        "--one-way-latency",
+        default=10,
+        help="Latency between replicas (we ignore client-server latency)",
+    )
+    parser.add_argument(
+        "--noop-rate",
+        default=1,
+        help="Time between no-op writes",
+    )
+    parser.add_argument(
+        "--write-wait",
+        default=20,
+        help="Time to wait before acknowledging a write",
+        type=int,
+    )
+    parser.add_argument(
+        "--operations",
+        default=10,
+        help="Number of operations (reads + writes)",
+        type=int,
+    )
+    parser.add_argument(
+        "--interarrival",
+        default=10,
+        help="Mean time units between operations",
+        type=int,
+    )
+    parser.add_argument(
+        "--seed",
+        default=int(time.monotonic_ns()),
+        help="For repeatability",
+        type=int,
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     initiate_logging()
     event_loop = get_event_loop()
-    event_loop.create_task("main", main(**vars(parse_args())))
+    event_loop.create_task("main", main(parse_args()))
     event_loop.run()
