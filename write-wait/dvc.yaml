@@ -3,3 +3,6 @@ stages:
     cmd: python write_wait.py
     params:
     - write_wait
+    deps:
+    - simulate.py
+    - write_wait.py

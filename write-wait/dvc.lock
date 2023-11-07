@@ -1,0 +1,23 @@
+schema: '2.0'
+stages:
+  write-wait:
+    cmd: python write_wait.py
+    deps:
+    - path: simulate.py
+      hash: md5
+      md5: 1630b1ed5dcd10790fd4e6fda0a2ffe6
+      size: 5343
+    - path: write_wait.py
+      hash: md5
+      md5: f6bd281b72ad0ed7b45e906e1029ed1f
+      size: 12589
+    params:
+      params.yaml:
+        write_wait:
+          one_way_latency: 10
+          noop_rate: 1
+          write_wait: 20
+          operations: 10
+          interarrival: 10
+          check_linearizability: true
+          seed: nil

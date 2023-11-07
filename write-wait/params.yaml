@@ -1,0 +1,8 @@
+write_wait:
+  one_way_latency: 10
+  noop_rate: 1
+  write_wait: 20
+  operations: 10
+  interarrival: 10
+  check_linearizability: true
+  seed: nil

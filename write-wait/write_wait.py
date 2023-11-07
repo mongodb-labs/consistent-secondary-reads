@@ -8,6 +8,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+import hydra
+import dvclive
+from omegaconf import DictConfig, OmegaConf
+
 from simulate import (
     get_event_loop,
     get_current_ts,
@@ -44,7 +48,7 @@ class Write:
 
 
 class Node:
-    def __init__(self, role: Role, ns: argparse.Namespace, prng: random.Random):
+    def __init__(self, role: Role, cfg: DictConfig, prng: random.Random):
         self.role = role
         self.prng = prng
         # Map key to (value, last-written time).
@@ -55,9 +59,9 @@ class Node:
         self.nodes: list["Node"] | None = None
         # Map Node ids to their last-replicated timestamps.
         self.node_replication_positions: dict[int, OpTime] = {}
-        self.one_way_latency: int = ns.one_way_latency
-        self.noop_rate: int = ns.noop_rate
-        self.write_wait: int = ns.write_wait
+        self.one_way_latency: int = cfg.one_way_latency
+        self.noop_rate: int = cfg.noop_rate
+        self.write_wait: int = cfg.write_wait
 
     def initiate(self, nodes: list["Node"]):
         self.nodes = nodes[:]
@@ -294,13 +298,15 @@ def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
         logging.info(x)
 
 
-async def main(ns: argparse.Namespace):
-    logging.info(vars(ns))
-    prng = random.Random(ns.seed)
-    primary = Node(role=Role.PRIMARY, ns=ns, prng=prng)
+async def main_coro(cfg: DictConfig, live: dvclive.Live):
+    logging.info(cfg)
+    seed = int(time.monotonic_ns() if cfg.seed is None else cfg.seed)
+    logging.info(f"Seed {seed}")
+    prng = random.Random(seed)
+    primary = Node(role=Role.PRIMARY, cfg=cfg, prng=prng)
     secondaries = [
-        Node(role=Role.SECONDARY, ns=ns, prng=prng),
-        Node(role=Role.SECONDARY, ns=ns, prng=prng),
+        Node(role=Role.SECONDARY, cfg=cfg, prng=prng),
+        Node(role=Role.SECONDARY, cfg=cfg, prng=prng),
     ]
     nodes = [primary] + secondaries
     for n in nodes:
@@ -311,8 +317,8 @@ async def main(ns: argparse.Namespace):
     tasks = []
     start_ts = 0
     # Schedule some tasks with Poisson start times. Each does one read or one write.
-    for i in range(ns.operations):
-        start_ts += round(prng.expovariate(1 / ns.interarrival))
+    for i in range(cfg.operations):
+        start_ts += round(prng.expovariate(1 / cfg.interarrival))
         if prng.randint(0, 1) == 0:
             coro = writer(
                 client_id=i, start_ts=start_ts, primary=primary, client_log=client_log
@@ -332,7 +338,7 @@ async def main(ns: argparse.Namespace):
 
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
-    if ns.check_linearizability:
+    if cfg.check_linearizability:
         do_linearizability_check(client_log)
 
 
@@ -381,8 +387,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+# TODO: need all these defaults?
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig):
     initiate_logging()
     event_loop = get_event_loop()
-    event_loop.create_task("main", main(parse_args()))
-    event_loop.run()
+    with dvclive.Live() as dvc_live:
+        event_loop.create_task("main", main_coro(cfg=cfg.write_wait, live=dvc_live))
+        event_loop.run()
+
+
+if __name__ == "__main__":
+    main()
