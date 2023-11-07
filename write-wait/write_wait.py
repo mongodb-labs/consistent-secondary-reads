@@ -1,4 +1,3 @@
-import argparse
 import bisect
 import enum
 import logging
@@ -10,8 +9,6 @@ from dataclasses import dataclass, field
 
 import dvclive
 import hydra
-from hydra.core.hydra_config import HydraConfig
-from hydra.types import RunMode
 from omegaconf import DictConfig
 
 from simulate import (
@@ -368,52 +365,6 @@ async def main_coro(cfg: DictConfig, live: dvclive.Live):
         do_linearizability_check(client_log)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--check-linearizability",
-        default=False,
-        action="store_true",
-        help="Check linearizability at the end (could be slow)",
-    )
-    parser.add_argument(
-        "--one-way-latency",
-        default=10,
-        help="Latency between replicas (we ignore client-server latency)",
-    )
-    parser.add_argument(
-        "--noop-rate",
-        default=1,
-        help="Time between no-op writes",
-    )
-    parser.add_argument(
-        "--write-wait",
-        default=20,
-        help="Time to wait before acknowledging a write",
-        type=int,
-    )
-    parser.add_argument(
-        "--operations",
-        default=10,
-        help="Number of operations (reads + writes)",
-        type=int,
-    )
-    parser.add_argument(
-        "--interarrival",
-        default=10,
-        help="Mean time units between operations",
-        type=int,
-    )
-    parser.add_argument(
-        "--seed",
-        default=int(time.monotonic_ns()),
-        help="For repeatability",
-        type=int,
-    )
-    return parser.parse_args()
-
-
-# TODO: need all these defaults?
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
     initiate_logging()
