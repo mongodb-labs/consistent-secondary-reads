@@ -1,0 +1,5 @@
+stages:
+  write-wait:
+    cmd: python write_wait.py
+    params:
+    - write_wait
