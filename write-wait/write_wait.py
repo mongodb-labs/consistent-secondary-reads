@@ -8,9 +8,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-import hydra
 import dvclive
-from omegaconf import DictConfig, OmegaConf
+import hydra
+from hydra.core.hydra_config import HydraConfig
+from hydra.types import RunMode
+from omegaconf import DictConfig
 
 from simulate import (
     get_event_loop,
@@ -229,8 +231,10 @@ async def writer(
     primary: Node,
     client_log: list[ClientLogEntry],
 ):
+    assert get_current_ts() == 0, f"Current ts {get_current_ts()}"
     await sleep(start_ts)
-    assert get_current_ts() == start_ts  # Deterministic scheduling!
+    # Deterministic scheduling!
+    assert get_current_ts() == start_ts, f"Current ts {get_current_ts()} != {start_ts}"
     value = str(uuid.uuid4())
     logger.info(f"Client {client_id} writing {value} to primary")
     await primary.write(key="x", value=value)
