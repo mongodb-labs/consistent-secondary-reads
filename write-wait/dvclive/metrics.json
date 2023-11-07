@@ -1,1 +1,4 @@
-{}
+{
+    "mean_write_latency": 23.333333333333332,
+    "mean_read_latency": 16.25
+}

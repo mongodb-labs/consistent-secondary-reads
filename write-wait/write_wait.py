@@ -189,6 +189,11 @@ class ClientLogEntry:
     key: str
     value: str | None = None
 
+    @property
+    def duration(self) -> int:
+        assert self.end_ts >= self.start_ts
+        return self.end_ts - self.start_ts
+
 
 async def reader(
     client_id: int,
@@ -298,6 +303,21 @@ def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
         logging.info(x)
 
 
+def log_metrics(live: dvclive.Live, client_log: list[ClientLogEntry]):
+    writes, reads = 0, 0
+    write_time, read_time = 0, 0
+    for entry in client_log:
+        if entry.op_type == ClientLogEntry.OpType.Write:
+            writes += 1
+            write_time += entry.duration
+        else:
+            reads += 1
+            read_time += entry.duration
+
+    live.log_metric("mean_write_latency", write_time / writes)
+    live.log_metric("mean_read_latency", read_time / reads)
+
+
 async def main_coro(cfg: DictConfig, live: dvclive.Live):
     logging.info(cfg)
     seed = int(time.monotonic_ns() if cfg.seed is None else cfg.seed)
@@ -338,6 +358,8 @@ async def main_coro(cfg: DictConfig, live: dvclive.Live):
 
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
+    log_metrics(live, client_log)
+    logging.info(live.summary)
     if cfg.check_linearizability:
         do_linearizability_check(client_log)
 

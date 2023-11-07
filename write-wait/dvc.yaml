@@ -6,3 +6,8 @@ stages:
     deps:
     - simulate.py
     - write_wait.py
+metrics:
+- dvclive/metrics.json
+plots:
+- dvclive/plots/metrics:
+    x: step
