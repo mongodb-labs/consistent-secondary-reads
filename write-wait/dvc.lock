@@ -9,15 +9,8 @@ stages:
       size: 5343
     - path: write_wait.py
       hash: md5
-      md5: f55bb79d28c6b8ba832599db9485f882
-      size: 12738
+      md5: ece86fb0e421dd4d2bb39f5c2c9d8c57
+      size: 12697
     params:
       params.yaml:
-        write_wait:
-          one_way_latency: 10
-          noop_rate: 1
-          write_wait: 20
-          operations: 10
-          interarrival: 10
-          check_linearizability: true
-          seed: nil
+        write_wait: 100

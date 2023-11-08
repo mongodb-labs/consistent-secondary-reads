@@ -7,8 +7,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+import yaml
+
 import dvclive
-import hydra
 from omegaconf import DictConfig
 
 from simulate import (
@@ -378,12 +379,12 @@ async def main_coro(cfg: DictConfig, live: dvclive.Live):
         do_linearizability_check(client_log)
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig):
+def main():
+    cfg = DictConfig(yaml.safe_load(open("params.yaml")))
     initiate_logging()
     event_loop = get_event_loop()
     with dvclive.Live() as dvc_live:
-        event_loop.create_task("main", main_coro(cfg=cfg.write_wait, live=dvc_live))
+        event_loop.create_task("main", main_coro(cfg=cfg, live=dvc_live))
         event_loop.run()
 
 
