@@ -14,13 +14,7 @@ import plotly.express as px
 import yaml
 from omegaconf import DictConfig
 
-from simulate import (
-    get_event_loop,
-    get_current_ts,
-    initiate_logging,
-    sleep,
-    Timestamp,
-)
+from simulate import Timestamp, get_current_ts, get_event_loop, initiate_logging, sleep
 
 logger = logging.getLogger("write-wait")
 
@@ -49,6 +43,20 @@ class Write:
     optime: OpTime
 
 
+class Metric:
+    def __init__(self):
+        self.total, self.n = 0, 0
+
+    def update(self, sample: int):
+        self.total += sample
+        self.n += 1
+
+    @property
+    def mean(self) -> float | None:
+        if self.n > 0:
+            return self.total / self.n
+
+
 class Node:
     def __init__(self, role: Role, cfg: DictConfig, prng: random.Random):
         self.role = role
@@ -64,8 +72,10 @@ class Node:
         self.one_way_latency: int = cfg.one_way_latency
         self.noop_rate: int = cfg.noop_rate
         self.write_wait: int = cfg.write_wait
-        self._total_commit_wait: int = 0  # For reporting.
-        self._number_of_writes: int = 0  # For reporting.
+        self.metric_replication_lag = Metric()
+        self.metric_commit_wait = Metric()
+        self.metric_commit_lag = Metric()
+        self.metric_write_wait = Metric()
 
     def initiate(self, nodes: list["Node"]):
         self.nodes = nodes[:]
@@ -76,11 +86,6 @@ class Node:
     @property
     def last_applied(self) -> OpTime:
         return self.log[-1].optime if self.log else OpTime.default()
-
-    @property
-    def mean_commit_wait(self) -> float | None:
-        if self._number_of_writes > 0:
-            return self._total_commit_wait / self._number_of_writes
 
     async def noop_writer(self):
         while True:
@@ -122,6 +127,8 @@ class Node:
                 optime=entry.optime,
             )
 
+            self.metric_replication_lag.update(get_current_ts() - entry.optime.ts)
+
     def update_secondary_position(self, secondary: "Node", optime: OpTime):
         if self.role is not Role.PRIMARY:
             return
@@ -143,7 +150,9 @@ class Node:
                 )
 
     def update_committed_optime(self, optime: OpTime):
-        self.committed_optime = max(self.committed_optime, optime)
+        if optime > self.committed_optime:
+            self.committed_optime = optime
+            self.metric_commit_lag.update(get_current_ts() - optime.ts)
 
     async def write(self, key: str, value: str):
         """Update a key."""
@@ -164,11 +173,12 @@ class Node:
         while self.committed_optime < optime:
             await sleep(1)
 
-        write_duration = get_current_ts() - write_start
-        self._total_commit_wait += write_duration
-        self._number_of_writes += 1
-        if self.write_wait > write_duration:
-            await sleep(self.write_wait - write_duration)
+        commit_wait = get_current_ts() - write_start
+        self.metric_commit_wait.update(commit_wait)
+        remaining_wait_duration = self.write_wait - commit_wait
+        if remaining_wait_duration > 0:
+            await sleep(remaining_wait_duration)
+        self.metric_write_wait.update(max(remaining_wait_duration, 0))
 
     async def read(self, key: str) -> str | None:
         """Return a key's latest value."""
@@ -400,7 +410,16 @@ async def main_coro(params: DictConfig, metrics: dict):
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
     save_metrics(metrics, client_log)
-    metrics["mean_commit_wait"] = primary.mean_commit_wait
+
+    def secondary_metric(name: str) -> float | None:
+        metrics = [getattr(s, name) for s in secondaries]
+        if any(m.n for m in metrics):
+            return sum(m.total for m in metrics) / sum(m.n for m in metrics)
+
+    metrics["mean_replication_lag"] = secondary_metric("metric_replication_lag")
+    metrics["mean_commit_lag"] = secondary_metric("metric_commit_lag")
+    metrics["mean_write_wait"] = primary.metric_write_wait.mean
+    metrics["mean_commit_wait"] = primary.metric_commit_wait.mean
     if params.check_linearizability:
         do_linearizability_check(client_log)
 

@@ -80,6 +80,7 @@ class _Task(Future):
 
 
 def sleep(delay: int) -> Future:
+    assert delay >= 0
     f = Future()
     _global_loop.call_later(delay=delay, callback=f.resolve)
     return f
