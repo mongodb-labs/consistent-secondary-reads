@@ -1,2 +1,4 @@
 omegaconf
+pandas
+plotly
 pyyaml

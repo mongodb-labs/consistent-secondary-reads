@@ -9,8 +9,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+import pandas as pd
+import plotly.express as px
 import yaml
-
 from omegaconf import DictConfig
 
 from simulate import (
@@ -333,6 +334,31 @@ def save_metrics(metrics: dict, client_log: list[ClientLogEntry]):
     metrics["mean_read_latency"] = read_time / reads
 
 
+def chart_metrics(csv_path: str):
+    df = pd.read_csv(csv_path)
+    df.rename(
+        columns={
+            "mean_read_latency": "read_latency",
+            "mean_write_latency": "write_latency",
+        },
+        inplace=True,
+    )
+    fig = px.line(
+        df,
+        x="write_wait",
+        y=["read_latency", "write_latency", "mean_commit_wait"],
+        labels={"variable": "Metrics", "value": "Values"},
+        title="Latency Metrics",
+    )
+
+    # Show vertical line on hover
+    fig.update_traces(mode="markers+lines", hovertemplate=None)
+    fig.update_layout(hovermode="x unified")
+    chart_path = "metrics/chart.html"
+    fig.write_html(chart_path)
+    logging.info(f"Created {chart_path}")
+
+
 async def main_coro(params: DictConfig, metrics: dict):
     logging.info(params)
     seed = int(time.monotonic_ns() if params.seed is None else params.seed)
@@ -399,6 +425,8 @@ def main():
     initiate_logging()
     event_loop = get_event_loop()
     csv_writer: None | csv.DictWriter = None
+    csv_path = "metrics/metrics.csv"
+    csv_file = open(csv_path, "w+")
     for params in all_param_combos("params.yaml"):
         metrics = {}
         event_loop.create_task("main", main_coro(params=params, metrics=metrics))
@@ -406,14 +434,14 @@ def main():
         logging.info(f"metrics: {metrics}")
         stats = metrics | dict(params)
         if csv_writer is None:
-            csv_writer = csv.DictWriter(
-                open("metrics/metrics.csv", "w+"), fieldnames=stats.keys()
-            )
-
+            csv_writer = csv.DictWriter(csv_file, fieldnames=stats.keys())
             csv_writer.writeheader()
 
         csv_writer.writerow(stats)
         event_loop.reset()
+
+    csv_file.close()
+    chart_metrics(csv_path)
 
 
 if __name__ == "__main__":
