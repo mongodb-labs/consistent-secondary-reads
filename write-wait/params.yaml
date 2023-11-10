@@ -1,6 +1,6 @@
 one_way_latency: 1
 noop_rate: 1
-write_wait: 100
+write_wait: range(0, 50, 5)
 operations: 10
 interarrival: 10
 check_linearizability: false

@@ -6,19 +6,12 @@ from dataclasses import dataclass, field
 
 Timestamp = int
 
-_current_ts: Timestamp = 0  # Wall clock time.
-
-
-def get_current_ts() -> Timestamp:
-    return _current_ts
-
 
 def initiate_logging() -> None:
     class CustomFormatter(logging.Formatter):
         def format(self, record):
-            global _current_ts
             original_msg = super().format(record)
-            return f"{_current_ts} {original_msg}"
+            return f"{get_current_ts()} {original_msg}"
 
     formatter = CustomFormatter(fmt="%(levelname)s: %(message)s")
     logging.basicConfig(level=logging.INFO)
@@ -102,21 +95,23 @@ class EventLoop:
         self._running = False
         # Priority queue of scheduled alarms.
         self._alarms: list[EventLoop._Alarm] = []
+        self._current_ts = 0
+
+    def reset(self):
+        self.__init__()
 
     def run(self):
-        global _current_ts
-
         self._running = True
         while self._running:
-            if _current_ts > 1e6:
+            if self._current_ts > 1e6:
                 _Task.print_all_tasks()
-                raise Exception(f"Timeout, current timestamp is {_current_ts}")
+                raise Exception(f"Timeout, current timestamp is {self._current_ts}")
 
             if len(self._alarms) > 0:
                 alarm: EventLoop._Alarm = heapq.heappop(self._alarms)
                 # Advance time to next alarm.
-                assert alarm.deadline >= _current_ts
-                _current_ts = alarm.deadline
+                assert alarm.deadline >= self._current_ts
+                self._current_ts = alarm.deadline
                 alarm.callback()
             else:
                 return  # All done.
@@ -145,7 +140,9 @@ class EventLoop:
             callback(*args, **kwargs)
             f.resolve()
 
-        alarm = EventLoop._Alarm(deadline=_current_ts + delay, callback=alarm_callback)
+        alarm = EventLoop._Alarm(
+            deadline=self._current_ts + delay, callback=alarm_callback
+        )
         heapq.heappush(self._alarms, alarm)
         return f
 
@@ -155,6 +152,10 @@ class EventLoop:
         Returns a Future that will be resolved after the coroutine finishes.
         """
         return _Task(name=name, coro=coro)
+
+    @property
+    def current_ts(self) -> int:
+        return self._current_ts
 
 
 _global_loop = EventLoop()
@@ -166,6 +167,10 @@ def get_event_loop() -> EventLoop:
     :rtype: object
     """
     return _global_loop
+
+
+def get_current_ts() -> Timestamp:
+    return get_event_loop().current_ts
 
 
 def _print_coro_position(task: _Task):

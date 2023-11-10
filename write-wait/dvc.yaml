@@ -6,8 +6,8 @@ stages:
     deps:
     - simulate.py
     - write_wait.py
-metrics:
-- dvclive/metrics.json
+
 plots:
-- dvclive/plots/metrics:
-    x: step
+  - metrics/metrics.csv:
+      x: write_wait
+      y: [mean_write_latency, mean_read_latency]

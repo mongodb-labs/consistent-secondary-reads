@@ -1,5 +1,7 @@
 import bisect
+import csv
 import enum
+import itertools
 import logging
 import random
 import statistics
@@ -9,7 +11,6 @@ from dataclasses import dataclass, field
 
 import yaml
 
-import dvclive
 from omegaconf import DictConfig
 
 from simulate import (
@@ -317,7 +318,7 @@ def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
         logging.info(x)
 
 
-def log_metrics(live: dvclive.Live, client_log: list[ClientLogEntry]):
+def save_metrics(metrics: dict, client_log: list[ClientLogEntry]):
     writes, reads = 0, 0
     write_time, read_time = 0, 0
     for entry in client_log:
@@ -328,19 +329,19 @@ def log_metrics(live: dvclive.Live, client_log: list[ClientLogEntry]):
             reads += 1
             read_time += entry.duration
 
-    live.log_metric("mean_write_latency", write_time / writes)
-    live.log_metric("mean_read_latency", read_time / reads)
+    metrics["mean_write_latency"] = write_time / writes
+    metrics["mean_read_latency"] = read_time / reads
 
 
-async def main_coro(cfg: DictConfig, live: dvclive.Live):
-    logging.info(cfg)
-    seed = int(time.monotonic_ns() if cfg.seed is None else cfg.seed)
+async def main_coro(params: DictConfig, metrics: dict):
+    logging.info(params)
+    seed = int(time.monotonic_ns() if params.seed is None else params.seed)
     logging.info(f"Seed {seed}")
     prng = random.Random(seed)
-    primary = Node(role=Role.PRIMARY, cfg=cfg, prng=prng)
+    primary = Node(role=Role.PRIMARY, cfg=params, prng=prng)
     secondaries = [
-        Node(role=Role.SECONDARY, cfg=cfg, prng=prng),
-        Node(role=Role.SECONDARY, cfg=cfg, prng=prng),
+        Node(role=Role.SECONDARY, cfg=params, prng=prng),
+        Node(role=Role.SECONDARY, cfg=params, prng=prng),
     ]
     nodes = [primary] + secondaries
     for n in nodes:
@@ -351,8 +352,8 @@ async def main_coro(cfg: DictConfig, live: dvclive.Live):
     tasks = []
     start_ts = 0
     # Schedule some tasks with Poisson start times. Each does one read or one write.
-    for i in range(cfg.operations):
-        start_ts += round(prng.expovariate(1 / cfg.interarrival))
+    for i in range(params.operations):
+        start_ts += round(prng.expovariate(1 / params.interarrival))
         if prng.randint(0, 1) == 0:
             coro = writer(
                 client_id=i, start_ts=start_ts, primary=primary, client_log=client_log
@@ -372,20 +373,47 @@ async def main_coro(cfg: DictConfig, live: dvclive.Live):
 
     lp.stop()
     logging.info(f"Finished after {get_current_ts()} ms (simulated)")
-    log_metrics(live, client_log)
-    live.log_metric("mean_commit_wait", primary.mean_commit_wait)
-    logging.info(live.summary)
-    if cfg.check_linearizability:
+    save_metrics(metrics, client_log)
+    metrics["mean_commit_wait"] = primary.mean_commit_wait
+    if params.check_linearizability:
         do_linearizability_check(client_log)
 
 
+def all_param_combos(path: str) -> list[DictConfig]:
+    param_combos: dict[list] = {}
+    # Load config file, keep all values as strings.
+    for k, v in yaml.safe_load(open(path)).items():
+        v_interpreted = eval(str(v))
+        try:
+            iter(v_interpreted)
+        except TypeError:
+            param_combos[k] = [v_interpreted]
+        else:
+            param_combos[k] = list(v_interpreted)
+
+    for values in itertools.product(*param_combos.values()):
+        yield DictConfig(dict(zip(param_combos.keys(), values)))
+
+
 def main():
-    cfg = DictConfig(yaml.safe_load(open("params.yaml")))
     initiate_logging()
     event_loop = get_event_loop()
-    with dvclive.Live() as dvc_live:
-        event_loop.create_task("main", main_coro(cfg=cfg, live=dvc_live))
+    csv_writer: None | csv.DictWriter = None
+    for params in all_param_combos("params.yaml"):
+        metrics = {}
+        event_loop.create_task("main", main_coro(params=params, metrics=metrics))
         event_loop.run()
+        logging.info(f"metrics: {metrics}")
+        stats = metrics | dict(params)
+        if csv_writer is None:
+            csv_writer = csv.DictWriter(
+                open("metrics/metrics.csv", "w+"), fieldnames=stats.keys()
+            )
+
+            csv_writer.writeheader()
+
+        csv_writer.writerow(stats)
+        event_loop.reset()
 
 
 if __name__ == "__main__":
