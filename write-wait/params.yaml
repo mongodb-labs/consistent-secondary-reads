@@ -1,6 +1,7 @@
-one_way_latency: 10
+one_way_latency_mean: 125
+one_way_latency_variance: 25
 noop_rate: 1
-write_wait: range(0, 50, 1)
+write_wait: range(200, 300, 5)
 operations: 1000
 interarrival: 5
 check_linearizability: false

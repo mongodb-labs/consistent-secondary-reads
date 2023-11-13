@@ -3,7 +3,6 @@ import csv
 import enum
 import itertools
 import logging
-import random
 import statistics
 import time
 import uuid
@@ -14,6 +13,7 @@ import plotly.express as px
 import yaml
 from omegaconf import DictConfig
 
+from prob import PRNG
 from simulate import Timestamp, get_current_ts, get_event_loop, initiate_logging, sleep
 
 logger = logging.getLogger("write-wait")
@@ -64,7 +64,7 @@ class Metrics:
 
 
 class Node:
-    def __init__(self, role: Role, cfg: DictConfig, prng: random.Random):
+    def __init__(self, role: Role, cfg: DictConfig, prng: PRNG):
         self.role = role
         self.prng = prng
         # Map key to (value, last-written time).
@@ -75,7 +75,6 @@ class Node:
         self.nodes: list["Node"] | None = None
         # Map Node ids to their last-replicated timestamps.
         self.node_replication_positions: dict[int, OpTime] = {}
-        self.one_way_latency: int = cfg.one_way_latency
         self.noop_rate: int = cfg.noop_rate
         self.write_wait: int = cfg.write_wait
         self.metrics = Metrics()
@@ -112,13 +111,13 @@ class Node:
                 log_position += 1
 
                 # Simulate waiting for entry to arrive. It may have arrived already.
-                apply_time = entry.optime.ts + self.one_way_latency_value()
+                apply_time = entry.optime.ts + self.prng.one_way_latency_value()
                 await sleep(max(0, apply_time - get_current_ts()))
                 self.data[entry.key] = (entry.value, entry.optime)
                 self.log.append(entry)
                 self.node_replication_positions[id(self)] = entry.optime
                 get_event_loop().call_later(
-                    self.one_way_latency_value(),
+                    self.prng.one_way_latency_value(),
                     primary.update_secondary_position,
                     secondary=self,
                     optime=entry.optime,
@@ -143,7 +142,7 @@ class Node:
         for n in self.nodes:
             if n is not self:
                 get_event_loop().call_later(
-                    self.one_way_latency_value(),
+                    self.prng.one_way_latency_value(),
                     n.update_committed_optime,
                     self.committed_optime,
                 )
@@ -198,9 +197,6 @@ class Node:
 
         return value
 
-    def one_way_latency_value(self) -> int:
-        return round(self.prng.expovariate(1 / self.one_way_latency))
-
 
 @dataclass
 class ClientLogEntry:
@@ -226,7 +222,7 @@ async def reader(
     start_ts: Timestamp,
     nodes: list[Node],
     client_log: list[ClientLogEntry],
-    prng: random.Random,
+    prng: PRNG,
 ):
     await sleep(start_ts)
     assert get_current_ts() == start_ts  # Deterministic scheduling!
@@ -370,7 +366,7 @@ async def main_coro(params: DictConfig, metrics: dict):
     logging.info(params)
     seed = int(time.monotonic_ns() if params.seed is None else params.seed)
     logging.info(f"Seed {seed}")
-    prng = random.Random(seed)
+    prng = PRNG(seed, params.one_way_latency_mean, params.one_way_latency_variance)
     primary = Node(role=Role.PRIMARY, cfg=params, prng=prng)
     secondaries = [
         Node(role=Role.SECONDARY, cfg=params, prng=prng),
@@ -386,7 +382,7 @@ async def main_coro(params: DictConfig, metrics: dict):
     start_ts = 0
     # Schedule some tasks with Poisson start times. Each does one read or one write.
     for i in range(params.operations):
-        start_ts += round(prng.expovariate(1 / params.interarrival))
+        start_ts += round(prng.exponential(params.interarrival))
         if prng.randint(0, 1) == 0:
             coro = writer(
                 client_id=i, start_ts=start_ts, primary=primary, client_log=client_log
