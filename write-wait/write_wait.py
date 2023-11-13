@@ -1,4 +1,4 @@
-import bisect
+import collections
 import csv
 import enum
 import itertools
@@ -43,18 +43,24 @@ class Write:
     optime: OpTime
 
 
-class Metric:
+class Metrics:
     def __init__(self):
-        self.total, self.n = 0, 0
+        self._totals = collections.Counter()
+        self._sample_counts = collections.Counter()
 
-    def update(self, sample: int):
-        self.total += sample
-        self.n += 1
+    def update(self, metric_name: str, sample: int) -> None:
+        self._totals[metric_name] += sample
+        self._sample_counts[metric_name] += 1
 
-    @property
-    def mean(self) -> float | None:
-        if self.n > 0:
-            return self.total / self.n
+    def total(self, metric_name: str) -> int:
+        return self._totals[metric_name]
+
+    def sample_count(self, metric_name: str) -> int:
+        return self._sample_counts[metric_name]
+
+    def mean(self, metric_name: str) -> float | None:
+        if self._sample_counts[metric_name] > 0:
+            return self._totals[metric_name] / self._sample_counts[metric_name]
 
 
 class Node:
@@ -72,16 +78,15 @@ class Node:
         self.one_way_latency: int = cfg.one_way_latency
         self.noop_rate: int = cfg.noop_rate
         self.write_wait: int = cfg.write_wait
-        self.metric_replication_lag = Metric()
-        self.metric_commit_wait = Metric()
-        self.metric_commit_lag = Metric()
-        self.metric_write_wait = Metric()
+        self.metrics = Metrics()
 
     def initiate(self, nodes: list["Node"]):
         self.nodes = nodes[:]
         self.node_replication_positions = {id(n): OpTime.default() for n in nodes}
-        get_event_loop().create_task("no-op writer", self.noop_writer())
-        get_event_loop().create_task("replication", self.replicate())
+        if self.role is Role.PRIMARY:
+            get_event_loop().create_task("no-op writer", self.noop_writer())
+        if self.role is Role.SECONDARY:
+            get_event_loop().create_task("replication", self.replicate())
 
     @property
     def last_applied(self) -> OpTime:
@@ -90,44 +95,38 @@ class Node:
     async def noop_writer(self):
         while True:
             await sleep(self.noop_rate)
-            if self.role is not Role.PRIMARY:
-                continue
-
-            await self.write("noop", "")
+            self._write_internal("noop", "")
 
     async def replicate(self):
-        peers = [n for n in self.nodes if n is not self]
+        log_position = 0
         while True:
-            await sleep(self.one_way_latency_value())  # Receive an entry from primary.
-            if self.role is Role.PRIMARY:
-                continue
-
+            await sleep(1)
             try:
-                primary = next(n for n in peers if n.role is Role.PRIMARY)
+                primary = next(n for n in self.nodes if n.role is Role.PRIMARY)
             except StopIteration:
                 continue  # No primary.
 
-            if len(self.log) >= len(primary.log):
-                continue
+            while log_position < len(primary.log):
+                # Find the next entry to replicate.
+                entry = primary.log[log_position]
+                log_position += 1
 
-            # Find the next entry to replicate and apply.
-            if len(self.log) == 0:
-                i = 0
-            else:
-                i = bisect.bisect_right(primary.log, self.log[-1])
+                # Simulate waiting for entry to arrive. It may have arrived already.
+                apply_time = entry.optime.ts + self.one_way_latency_value()
+                await sleep(max(0, apply_time - get_current_ts()))
+                self.data[entry.key] = (entry.value, entry.optime)
+                self.log.append(entry)
+                self.node_replication_positions[id(self)] = entry.optime
+                get_event_loop().call_later(
+                    self.one_way_latency_value(),
+                    primary.update_secondary_position,
+                    secondary=self,
+                    optime=entry.optime,
+                )
 
-            entry = primary.log[i]
-            self.data[entry.key] = (entry.value, entry.optime)
-            self.log.append(entry)
-            self.node_replication_positions[id(self)] = entry.optime
-            get_event_loop().call_later(
-                self.one_way_latency_value(),
-                primary.update_secondary_position,
-                secondary=self,
-                optime=entry.optime,
-            )
-
-            self.metric_replication_lag.update(get_current_ts() - entry.optime.ts)
+                self.metrics.update(
+                    "replication_lag", get_current_ts() - entry.optime.ts
+                )
 
     def update_secondary_position(self, secondary: "Node", optime: OpTime):
         if self.role is not Role.PRIMARY:
@@ -152,33 +151,36 @@ class Node:
     def update_committed_optime(self, optime: OpTime):
         if optime > self.committed_optime:
             self.committed_optime = optime
-            self.metric_commit_lag.update(get_current_ts() - optime.ts)
+            self.metrics.update("commit_lag", get_current_ts() - optime.ts)
 
-    async def write(self, key: str, value: str):
-        """Update a key."""
-        write_start = get_current_ts()
-        optime = OpTime(write_start, 0)
+    def _write_internal(self, key: str, value: str) -> OpTime:
+        """Update a key and append an oplog entry."""
+        if self.role is not Role.PRIMARY:
+            raise Exception("Not primary")
+
+        optime = OpTime(get_current_ts(), 0)
         if len(self.log) > 0 and self.log[-1].optime.ts == optime.ts:
             optime.i = self.log[-1].optime.i + 1
 
         w = Write(key=key, value=value, optime=optime)
-        if self.role is not Role.PRIMARY:
-            raise Exception("Not primary")
-
         self.data[w.key] = (value, w.optime)
         # TODO: Try a realistic oplog, reserve a future slot and eventually fill it.
         self.log.append(w)
         self.node_replication_positions[id(self)] = optime
-        assert write_start == get_current_ts()  # Assume no time since the write began.
+        return optime
+
+    async def write(self, key: str, value: str):
+        """Update a key, append an oplog entry, wait for w:majority and write_wait."""
+        optime = self._write_internal(key=key, value=value)
         while self.committed_optime < optime:
             await sleep(1)
 
-        commit_wait = get_current_ts() - write_start
-        self.metric_commit_wait.update(commit_wait)
+        commit_wait = get_current_ts() - optime.ts
+        self.metrics.update("commit_wait", commit_wait)
         remaining_wait_duration = self.write_wait - commit_wait
         if remaining_wait_duration > 0:
             await sleep(remaining_wait_duration)
-        self.metric_write_wait.update(max(remaining_wait_duration, 0))
+        self.metrics.update("write_wait", max(remaining_wait_duration, 0))
 
     async def read(self, key: str) -> str | None:
         """Return a key's latest value."""
@@ -340,25 +342,20 @@ def save_metrics(metrics: dict, client_log: list[ClientLogEntry]):
             reads += 1
             read_time += entry.duration
 
-    metrics["mean_write_latency"] = write_time / writes
-    metrics["mean_read_latency"] = read_time / reads
+    metrics["write_latency"] = write_time / writes if writes else None
+    metrics["read_latency"] = read_time / reads if reads else None
 
 
-def chart_metrics(csv_path: str):
+def chart_metrics(raw_params: dict, csv_path: str):
     df = pd.read_csv(csv_path)
-    df.rename(
-        columns={
-            "mean_read_latency": "read_latency",
-            "mean_write_latency": "write_latency",
-        },
-        inplace=True,
-    )
+    y_columns = ["read_latency", "write_latency", "commit_wait"]
+
     fig = px.line(
         df,
         x="write_wait",
-        y=["read_latency", "write_latency", "mean_commit_wait"],
+        y=y_columns,
         labels={"variable": "Metrics", "value": "Values"},
-        title="Latency Metrics",
+        title=", ".join(f"{k}={v}" for k, v in raw_params.items()),
     )
 
     # Show vertical line on hover
@@ -412,22 +409,23 @@ async def main_coro(params: DictConfig, metrics: dict):
     save_metrics(metrics, client_log)
 
     def secondary_metric(name: str) -> float | None:
-        metrics = [getattr(s, name) for s in secondaries]
-        if any(m.n for m in metrics):
-            return sum(m.total for m in metrics) / sum(m.n for m in metrics)
+        total = sum(s.metrics.total(name) for s in secondaries)
+        sample_count = sum(s.metrics.sample_count(name) for s in secondaries)
+        if sample_count > 0:
+            return total / sample_count
 
-    metrics["mean_replication_lag"] = secondary_metric("metric_replication_lag")
-    metrics["mean_commit_lag"] = secondary_metric("metric_commit_lag")
-    metrics["mean_write_wait"] = primary.metric_write_wait.mean
-    metrics["mean_commit_wait"] = primary.metric_commit_wait.mean
+    metrics["replication_lag"] = secondary_metric("replication_lag")
+    metrics["commit_lag"] = secondary_metric("commit_lag")
+    metrics["write_wait"] = primary.metrics.mean("write_wait")
+    metrics["commit_wait"] = primary.metrics.mean("commit_wait")
     if params.check_linearizability:
         do_linearizability_check(client_log)
 
 
-def all_param_combos(path: str) -> list[DictConfig]:
+def all_param_combos(raw_params: dict) -> list[DictConfig]:
     param_combos: dict[list] = {}
     # Load config file, keep all values as strings.
-    for k, v in yaml.safe_load(open(path)).items():
+    for k, v in raw_params.items():
         v_interpreted = eval(str(v))
         try:
             iter(v_interpreted)
@@ -446,7 +444,8 @@ def main():
     csv_writer: None | csv.DictWriter = None
     csv_path = "metrics/metrics.csv"
     csv_file = open(csv_path, "w+")
-    for params in all_param_combos("params.yaml"):
+    raw_params = yaml.safe_load(open("params.yaml"))
+    for params in all_param_combos(raw_params):
         metrics = {}
         event_loop.create_task("main", main_coro(params=params, metrics=metrics))
         event_loop.run()
@@ -460,7 +459,7 @@ def main():
         event_loop.reset()
 
     csv_file.close()
-    chart_metrics(csv_path)
+    chart_metrics(raw_params=raw_params, csv_path=csv_path)
 
 
 if __name__ == "__main__":
