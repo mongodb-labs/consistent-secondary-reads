@@ -7,11 +7,16 @@ from scipy.optimize import fsolve
 
 class PRNG:
     def __init__(
-        self, seed: int, one_way_latency_mean: float, one_way_latency_variance: float
+        self,
+        seed: int,
+        one_way_latency_mean: float,
+        one_way_latency_variance: float,
+        zipf_skewness: float,
     ):
         self._random_state = np.random.RandomState(seed % 2**32)
         self._one_way_latency_mean = one_way_latency_mean
         self._one_way_latency_variance = one_way_latency_variance
+        self._zipf_skewness = zipf_skewness
 
     def randint(self, low_inclusive: int, high_inclusive: int) -> int:
         # NumPy's rand_int excludes the high value, make it inclusive.
@@ -25,6 +30,9 @@ class PRNG:
             self._one_way_latency_mean, self._one_way_latency_variance
         )
         return self._random_state.lognormal(mu, sigma)
+
+    def zipf_value(self):
+        return np.random.zipf(self._zipf_skewness)
 
 
 @lru_cache

@@ -5,4 +5,5 @@ write_wait: range(200, 300, 5)
 operations: 1000
 interarrival: 5
 check_linearizability: false
+zipf_skewness: 1.1
 seed:

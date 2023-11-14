@@ -231,10 +231,13 @@ async def reader(
     node_index = prng.randint(0, len(nodes) - 1)
     node = (nodes)[node_index]
     node_name = f"node {node_index} {node.role.name}"
-    logger.info(f"Client {client_id} reading from {node_name}")
-    value = await node.read(key="x")
+    key = str(prng.zipf_value())
+    logger.info(f"Client {client_id} reading key {key} from {node_name}")
+    value = await node.read(key=key)
     latency = get_current_ts() - start_ts
-    logger.info(f"Client {client_id} read {value} from {node_name}, latency={latency}")
+    logger.info(
+        f"Client {client_id} read key {key}={value} from {node_name}, latency={latency}"
+    )
     client_log.append(
         ClientLogEntry(
             client_id=client_id,
@@ -253,16 +256,18 @@ async def writer(
     start_ts: Timestamp,
     primary: Node,
     client_log: list[ClientLogEntry],
+    prng: PRNG,
 ):
     assert get_current_ts() == 0, f"Current ts {get_current_ts()}"
     await sleep(start_ts)
     # Deterministic scheduling!
     assert get_current_ts() == start_ts, f"Current ts {get_current_ts()} != {start_ts}"
+    key = str(prng.zipf_value())
     value = str(uuid.uuid4())
-    logger.info(f"Client {client_id} writing {value} to primary")
-    await primary.write(key="x", value=value)
+    logger.info(f"Client {client_id} writing key {key}={value} to primary")
+    await primary.write(key=key, value=value)
     latency = get_current_ts() - start_ts
-    logger.info(f"Client {client_id} wrote {value}, latency={latency}")
+    logger.info(f"Client {client_id} wrote key {key}={value}, latency={latency}")
     client_log.append(
         ClientLogEntry(
             client_id=client_id,
@@ -318,6 +323,7 @@ def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
 
         return None
 
+    logging.info("Checking linearizability....")
     check_start = time.monotonic()
     # Sort by start_ts to make the search succeed sooner.
     result = linearize(sorted(client_log, key=lambda y: y.start_ts), {})
@@ -380,7 +386,12 @@ async def main_coro(params: DictConfig, metrics: dict):
     logging.info(params)
     seed = int(time.monotonic_ns() if params.seed is None else params.seed)
     logging.info(f"Seed {seed}")
-    prng = PRNG(seed, params.one_way_latency_mean, params.one_way_latency_variance)
+    prng = PRNG(
+        seed,
+        params.one_way_latency_mean,
+        params.one_way_latency_variance,
+        params.zipf_skewness,
+    )
     primary = Node(role=Role.PRIMARY, cfg=params, prng=prng)
     secondaries = [
         Node(role=Role.SECONDARY, cfg=params, prng=prng),
@@ -399,7 +410,11 @@ async def main_coro(params: DictConfig, metrics: dict):
         start_ts += round(prng.exponential(params.interarrival))
         if prng.randint(0, 1) == 0:
             coro = writer(
-                client_id=i, start_ts=start_ts, primary=primary, client_log=client_log
+                client_id=i,
+                start_ts=start_ts,
+                primary=primary,
+                client_log=client_log,
+                prng=prng,
             )
         else:
             coro = reader(
