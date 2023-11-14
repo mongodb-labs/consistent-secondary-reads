@@ -189,9 +189,9 @@ class Node:
             while self.last_applied.ts + self.write_wait < query_start:
                 await sleep(1)
 
-        # Wait for item's last-written OpTime (last applied entry if no item) to commit,
-        # aka "rinse".
-        value, last_written_optime = self.data.get(key, (None, self.last_applied))
+        # Wait for item's last-written OpTime (or OpTime.default() if no item) to
+        # commit, aka "rinse".
+        value, last_written_optime = self.data.get(key, (None, OpTime.default()))
         while self.committed_optime < last_written_optime:
             await sleep(1)
 
