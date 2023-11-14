@@ -206,6 +206,7 @@ class ClientLogEntry:
 
     client_id: int
     op_type: OpType
+    server_role: Role
     start_ts: Timestamp
     end_ts: Timestamp
     key: str
@@ -232,11 +233,13 @@ async def reader(
     node_name = f"node {node_index} {node.role.name}"
     logger.info(f"Client {client_id} reading from {node_name}")
     value = await node.read(key="x")
-    logger.info(f"Client {client_id} read {value} from {node_name}")
+    latency = get_current_ts() - start_ts
+    logger.info(f"Client {client_id} read {value} from {node_name}, latency={latency}")
     client_log.append(
         ClientLogEntry(
             client_id=client_id,
             op_type=ClientLogEntry.OpType.Read,
+            server_role=node.role,
             start_ts=start_ts,
             end_ts=get_current_ts(),
             key="x",
@@ -258,11 +261,13 @@ async def writer(
     value = str(uuid.uuid4())
     logger.info(f"Client {client_id} writing {value} to primary")
     await primary.write(key="x", value=value)
-    logger.info(f"Client {client_id} wrote {value}")
+    latency = get_current_ts() - start_ts
+    logger.info(f"Client {client_id} wrote {value}, latency={latency}")
     client_log.append(
         ClientLogEntry(
             client_id=client_id,
             op_type=ClientLogEntry.OpType.Write,
+            server_role=Role.PRIMARY,
             start_ts=start_ts,
             end_ts=get_current_ts(),
             key="x",
@@ -328,23 +333,32 @@ def do_linearizability_check(client_log: list[ClientLogEntry]) -> None:
 
 
 def save_metrics(metrics: dict, client_log: list[ClientLogEntry]):
-    writes, reads = 0, 0
-    write_time, read_time = 0, 0
+    writes, prim_reads, sec_reads = 0, 0, 0
+    write_time, prim_read_time, sec_read_time = 0, 0, 0
     for entry in client_log:
         if entry.op_type == ClientLogEntry.OpType.Write:
             writes += 1
             write_time += entry.duration
+        elif entry.server_role is Role.PRIMARY:
+            prim_reads += 1
+            prim_read_time += entry.duration
         else:
-            reads += 1
-            read_time += entry.duration
+            sec_reads += 1
+            sec_read_time += entry.duration
 
     metrics["write_latency"] = write_time / writes if writes else None
-    metrics["read_latency"] = read_time / reads if reads else None
+    metrics["prim_read_latency"] = prim_read_time / prim_reads if prim_reads else None
+    metrics["sec_read_latency"] = sec_read_time / sec_reads if sec_reads else None
 
 
 def chart_metrics(raw_params: dict, csv_path: str):
     df = pd.read_csv(csv_path)
-    y_columns = ["read_latency", "write_latency", "commit_wait"]
+    y_columns = [
+        "prim_read_latency",
+        "sec_read_latency",
+        "write_latency",
+        "commit_wait",
+    ]
 
     fig = px.line(
         df,
