@@ -1,9 +1,10 @@
-one_way_latency_mean: 125
-one_way_latency_variance: 25
-noop_rate: 1
-write_wait: range(200, 300, 5)
-operations: 1000
-interarrival: 5
-check_linearizability: false
-zipf_skewness: 1.1
-seed:
+one_way_latency_mean: 125  # Mean time for a message to go from one replica set node to another.
+one_way_latency_variance: 25  # Variance for one-way latency, which is lognormal distributed.
+noop_rate: 1  # How many time units between no-op writes.
+write_wait: range(200, 300, 5)  # How long the primary waits, after writing, to ack the write.
+operations: 1000  # How many reads + writes to simulate.
+interarrival: 5  # Mean time between operations, which are Poisson-distributed.
+check_linearizability: false  # Whether to check if the history was linearizable (slow!).
+zipf_skewness: 1.1  # How skewed is the access pattern? Must be >1, bigger is more skewed.
+seed:  # Optional random seed for reproducibility.
+
