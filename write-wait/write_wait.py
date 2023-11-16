@@ -174,9 +174,9 @@ class Node:
         while self.committed_optime < optime:
             await sleep(1)
 
-        commit_wait = get_current_ts() - optime.ts
-        self.metrics.update("commit_wait", commit_wait)
-        remaining_wait_duration = self.write_wait - commit_wait
+        commit_latency = get_current_ts() - optime.ts
+        self.metrics.update("commit_latency", commit_latency)
+        remaining_wait_duration = self.write_wait - commit_latency
         if remaining_wait_duration > 0:
             await sleep(remaining_wait_duration)
         self.metrics.update("write_wait", max(remaining_wait_duration, 0))
@@ -360,10 +360,11 @@ def save_metrics(metrics: dict, client_log: list[ClientLogEntry]):
 def chart_metrics(raw_params: dict, csv_path: str):
     df = pd.read_csv(csv_path)
     y_columns = [
+        "commit_latency",
         "prim_read_latency",
+        "replication_lag",
         "sec_read_latency",
         "write_latency",
-        "commit_wait",
     ]
 
     fig = px.line(
@@ -442,7 +443,7 @@ async def main_coro(params: DictConfig, metrics: dict):
     metrics["replication_lag"] = secondary_metric("replication_lag")
     metrics["commit_lag"] = secondary_metric("commit_lag")
     metrics["write_wait"] = primary.metrics.mean("write_wait")
-    metrics["commit_wait"] = primary.metrics.mean("commit_wait")
+    metrics["commit_latency"] = primary.metrics.mean("commit_latency")
     if params.check_linearizability:
         do_linearizability_check(client_log)
 
